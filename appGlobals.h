@@ -37,14 +37,14 @@
 /** Do not change anything below here unless you know what you are doing **/
 
 //#define DEV_ONLY // leave commented out
-#define STATIC_IP_OCTAL "132" // dev only
+#define STATIC_IP_OCTAL "133" // dev only
 #define CHECK_MEM false // leave as false
 #define FLUSH_DELAY 0 // for debugging crashes
  
 #define APP_NAME "ESP-CAM_MJPEG" // max 15 chars
-#define APP_VER "8.3.2"
+#define APP_VER "8.4"
 
-#define MAX_CLIENTS 2 // allowing too many concurrent web clients can cause error
+#define MAX_CLIENTS 2 // allowing too many concurrent web clients can cause errors
 #define DATA_DIR "/data"
 #define HTML_EXT ".htm"
 #define TEXT_EXT ".txt"
@@ -125,7 +125,6 @@ void openSDfile(const char* streamFile);
 void prepAviIndex(bool isTL = false);
 bool prepRecording();
 void prepMic();
-float readTemperature(bool isCelsius);
 void setCamPan(int panVal);
 void setCamTilt(int tiltVal);
 uint8_t setFPS(uint8_t val);
@@ -209,6 +208,7 @@ extern bool micUse; // true to use external I2S microphone
 
 // sensors 
 extern int pirPin; // if usePir is true
+extern bool pirVal;
 extern int lampPin; // if useLamp is true
 // Pan / Tilt Servos 
 extern int servoPanPin; // if useServos is true
@@ -218,8 +218,8 @@ extern int ds18b20Pin; // if INCLUDE_DS18B20 uncommented
 // batt monitoring 
 extern int voltPin; 
 
-extern float dsTemp;
-extern bool pirVal;
+
+
 
 // microphone recording
 extern int micSckPin; // I2S SCK
@@ -237,7 +237,6 @@ extern int servoMaxPulseWidth;
 extern int voltDivider;
 extern int voltLow;
 extern int voltInterval;
-extern float currentVoltage; 
 
 // audio
 extern const uint32_t SAMPLE_RATE; // audio sample rate

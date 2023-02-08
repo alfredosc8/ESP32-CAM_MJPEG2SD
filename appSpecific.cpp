@@ -44,13 +44,14 @@ bool updateAppStatus(const char* variable, const char* value) {
   else if(!strcmp(variable, "forceRecord")) forceRecord = (intVal) ? true : false;                                       
   else if(!strcmp(variable, "dbgMotion")) {
     // only enable show motion if motion detect enabled
-    if (intVal && useMotion) dbgMotion = true;
-    else  dbgMotion = false;
+    dbgMotion = (intVal && useMotion) ? true : false;
     doRecording = !dbgMotion;
   }
   
   // peripherals
   else if(!strcmp(variable, "useIOextender")) useIOextender = (bool)intVal;
+  else if(!strcmp(variable, "uartTxdPin")) uartTxdPin = intVal;
+  else if(!strcmp(variable, "uartRxdPin")) uartRxdPin = intVal;
   else if(!strcmp(variable, "pirUse")) pirUse = (bool)intVal;
   else if(!strcmp(variable, "lampUse")) lampUse = (bool)intVal;
   else if(!strcmp(variable, "lampAuto")) lampAuto = (bool)intVal;
@@ -152,8 +153,10 @@ void wsAppSpecificHandler(const char* wsMsg) {
     break;
     case 'K': 
       // kill websocket connection
+      killWebSocket();
     break;
     default:
+      LOG_WRN("unknown command %c", (char)wsMsg[0]);
     break;
   }
 }
@@ -166,6 +169,7 @@ void buildAppJsonString(bool filter) {
   float aTemp = readTemperature(true);
   if (aTemp > -127.0) p += sprintf(p, "\"atemp\":\"%0.1f\",", aTemp);
   else p += sprintf(p, "\"atemp\":\"n/a\",");
+  float currentVoltage = readVoltage();
   if (currentVoltage < 0) p += sprintf(p, "\"battv\":\"n/a\",");
   else p += sprintf(p, "\"battv\":\"%0.1fV\",", currentVoltage); 
   if (forcePlayback && !doPlayback) {
@@ -173,6 +177,7 @@ void buildAppJsonString(bool filter) {
     forcePlayback = false;
     p += sprintf(p, "\"forcePlayback\":0,");  
   }
+  p += sprintf(p, "\"showRecord\":%u,", (uint8_t)isCapturing);
   p += sprintf(p, "\"camModel\":\"%s\",", camModel); 
   
   // Extend info
@@ -208,6 +213,7 @@ void buildAppJsonString(bool filter) {
   //p += sprintf(p, "\"vcc\":\"%i V\",", ESP.getVcc() / 1023.0F; ); 
   *p = 0;
 }
+
 bool appDataFiles() {
   // callback from setupAssist.cpp, for any app specific files 
   return true;

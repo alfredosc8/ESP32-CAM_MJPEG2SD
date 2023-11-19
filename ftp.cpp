@@ -1,52 +1,56 @@
 // Store SD card or SPIFFS content on a remote server using FTP
-//
+// 
 // s60sc 2022, based on code contributed by gemi254
 
 #include "appGlobals.h"
 
+
 // Ftp server params, setup via web page
-char ftp_server[32];
+char ftp_server[MAX_HOST_LEN];
 uint16_t ftp_port = 21;
-char ftp_user[32];
+char ftp_user[MAX_HOST_LEN];
 char FTP_Pass[MAX_PWD_LEN];
-char ftp_wd[64]; 
+char ftp_wd[FILE_NAME_LEN]; 
 uint8_t percentLoaded = 0;
+bool useFtps = false;
 
 // FTP control
 static char rspBuf[256]; // Ftp response buffer
-static char respCodeRx[4]; // ftp response code                        
+static char respCodeRx[4]; // ftp response code      
 TaskHandle_t ftpHandle = NULL;
 static char storedPathName[FILE_NAME_LEN];
 static bool uploadInProgress = false;
-static bool deleteAfter = false;
+bool deleteAfter = false; // auto delete after upload
+bool autoUpload = false;  // Automatically upload every created file to remote ftp server
 static fs::FS fp = STORAGE;
+static byte* chunk;
 #define NO_CHECK "999"
 
 // WiFi Clients
-WiFiClient client;
+WiFiClient rclient;
 WiFiClient dclient;
 
 static bool sendFtpCommand(const char* cmd, const char* param, const char* respCode, const char* respCode2 = NO_CHECK) {
   // build and send ftp command
   if (strlen(cmd)) {
-    client.print(cmd);
-    client.println(param);
+    rclient.print(cmd);
+    rclient.println(param);
   }
   LOG_DBG("Sent cmd: %s%s", cmd, param);
   
   // wait for ftp server response
   uint32_t start = millis();
-  while (!client.available() && millis() < start + (responseTimeoutSecs * 1000)) delay(1);
-  if (!client.available()) {
+  while (!rclient.available() && millis() < start + (responseTimeoutSecs * 1000)) delay(1);
+  if (!rclient.available()) {
     LOG_ERR("FTP server response timeout");
     return false;
   }
   // read in response code and message
-  client.read((uint8_t*)respCodeRx, 3); 
+  rclient.read((uint8_t*)respCodeRx, 3); 
   respCodeRx[3] = 0; // terminator
-  int readLen = client.read((uint8_t*)rspBuf, 255);
+  int readLen = rclient.read((uint8_t*)rspBuf, 255);
   rspBuf[readLen] = 0;
-  while (client.available()) client.read(); // bin the rest of response
+  while (rclient.available()) rclient.read(); // bin the rest of response
 
   // check response code with expected
   LOG_DBG("Rx code: %s, resp: %s", respCodeRx, rspBuf);
@@ -62,16 +66,21 @@ static bool sendFtpCommand(const char* cmd, const char* param, const char* respC
 }
 
 static bool ftpConnect(){
-  // Connect to ftp and change to root dir
-  if (client.connect(ftp_server, ftp_port)) {
-    LOG_DBG("FTP connected at %s:%u", ftp_server, ftp_port);
-  } else {
+  // Connect to ftp or ftps
+  if (rclient.connect(ftp_server, ftp_port)) {LOG_DBG("FTP connected at %s:%u", ftp_server, ftp_port);}
+  else {
     LOG_ERR("Error opening ftp connection to %s:%u", ftp_server, ftp_port);
     return false;
   }
   if (!sendFtpCommand("", "", "220")) return false;
+  if (useFtps) {
+    if (sendFtpCommand("AUTH ", "TLS", "234")) {
+      /* NOT IMPLEMENTED */
+    } else LOG_WRN("FTPS not available");
+  }
   if (!sendFtpCommand("USER ", ftp_user, "331")) return false;
   if (!sendFtpCommand("PASS ", FTP_Pass, "230")) return false;
+  // change to supplied folder
   if (!sendFtpCommand("CWD ", ftp_wd, "250")) return false;
   if (!sendFtpCommand("Type I", "", "200")) return false;
   return true;
@@ -84,6 +93,7 @@ static bool createFtpFolder(const char* folderName) {
   if (strcmp(respCodeRx, "550") == 0) {
     // non existent folder, create it
     if (!sendFtpCommand("MKD ", folderName, "257")) return false;
+    //sendFtpCommand("SITE CHMOD 755 ", folderName, "200", "550"); // unix only
     if (!sendFtpCommand("CWD ", folderName, "250")) return false;         
   }
   return true;
@@ -125,16 +135,21 @@ static bool openDataPort() {
 }
 
 static bool ftpStoreFile(File &fh) {
-  // Upload individual file to current folder, overwrite any existing file  
-  if (strstr(fh.name(), FILE_EXT) == NULL) return false; // folder, or not valid file type    
+  // Upload individual file to current folder, overwrite any existing file 
+  // reject if folder, or not valid file type    
+#ifdef ISCAM
+  if (strstr(fh.name(), AVI_EXT) == NULL && strstr(fh.name(), CSV_EXT) == NULL) return false; 
+#else
+  if (strstr(fh.name(), FILE_EXT) == NULL) return false; 
+#endif
   char ftpSaveName[FILE_NAME_LEN];
   strcpy(ftpSaveName, fh.name());
   size_t fileSize = fh.size();
-  LOG_INF("Upload file: %s, size: %0.1fMB", ftpSaveName, (float)(fileSize)/ONEMEG);    
+  LOG_INF("Upload file: %s, size: %s", ftpSaveName, fmtSize(fileSize));    
 
   // open data connection
   openDataPort();
-  uint32_t writeBytes = 0, progCnt = 0; 
+  uint32_t writeBytes = 0; 
   uint32_t uploadStart = millis();
   size_t readLen, writeLen;
   if (!sendFtpCommand("STOR ", ftpSaveName, "150", "125")) return false;
@@ -148,16 +163,18 @@ static bool ftpStoreFile(File &fh) {
         LOG_ERR("Upload file to ftp failed");
         return false;
       }
-      progCnt++;
-      percentLoaded = writeBytes * 100 / fileSize;
-      if (progCnt % 50 == 0) LOG_INF("Uploaded %u%%", percentLoaded); 
+      if (calcProgress(writeBytes, fileSize, 5, percentLoaded)) LOG_INF("Uploaded %u%%", percentLoaded); 
     }
   } while (readLen > 0);
   dclient.stop();
   percentLoaded = 100;
-  if (sendFtpCommand("", "", "226")) LOG_ALT("Uploaded %0.1fMB in %u sec", (float)(writeBytes) / ONEMEG, (millis() - uploadStart) / 1000); 
+  bool res = sendFtpCommand("", "", "226");
+  if (res) {
+    LOG_ALT("Uploaded %s in %u sec", fmtSize(writeBytes), (millis() - uploadStart) / 1000);
+    //sendFtpCommand("SITE CHMOD 644 ", ftpSaveName, "200", "550"); // unix only
+  }
   else LOG_ERR("File transfer not successful");
-  return true;
+  return res;
 }
 
 static bool uploadFolderOrFileFtp() {
@@ -177,12 +194,25 @@ static bool uploadFolderOrFileFtp() {
     return false;
   }  
 
-  bool res;
+  bool res = false;
   const int saveRefreshVal = refreshVal;
   refreshVal = 1;
   if (!root.isDirectory()) {
     // Upload a single file 
     if (getFolderName(root.path())) res = ftpStoreFile(root); 
+#ifdef ISCAM
+    // upload corresponding csv file if exists
+    if (res) {
+      char ftpSaveName[FILE_NAME_LEN];
+      strcpy(ftpSaveName, root.path());
+      changeExtension(ftpSaveName, CSV_EXT);
+      if (fp.exists(ftpSaveName)) {
+        File csv = fp.open(ftpSaveName);
+        res = ftpStoreFile(csv);
+        csv.close();
+      }
+    }
+#endif
   } else {  
     // Upload a whole folder, file by file
     LOG_INF("Uploading folder: ", root.name()); 
@@ -206,25 +236,28 @@ static bool uploadFolderOrFileFtp() {
 
 static void FTPtask(void* parameter) {
   // process an FTP request
+#ifdef ISCAM
   doPlayback = false; // close any current playback
+#endif
+  chunk = psramFound() ? (byte*)ps_malloc(CHUNKSIZE) : (byte*)malloc(CHUNKSIZE); 
   bool res = uploadFolderOrFileFtp();
   // Disconnect from ftp server
-  client.println("QUIT");
+  rclient.println("QUIT");
   dclient.stop();
-  client.stop();
+  rclient.stop();
   if (res && deleteAfter) deleteFolderOrFile(storedPathName);
   uploadInProgress = false;
+  free(chunk);
   vTaskDelete(NULL);
 }
 
-bool ftpFileOrFolder(const char* fileFolder, bool _deleteAfter) {
+bool ftpFileOrFolder(const char* fileFolder) {
   // called from other functions to commence FTP upload
+  setFolderName(fileFolder, storedPathName);
   if (!uploadInProgress) {
     uploadInProgress = true;
-    strcpy(storedPathName, fileFolder);
-    deleteAfter = _deleteAfter;
-    xTaskCreate(&FTPtask, "FTPtask", 1024 * 3, NULL, 1, &ftpHandle);    
+    xTaskCreate(&FTPtask, "FTPtask", FTP_STACK_SIZE, NULL, 1, &ftpHandle);    
     return true;
-  } else LOG_WRN("Unable to upload %s as another upload in progress", fileFolder);
+  } else LOG_WRN("Unable to upload %s as another upload in progress", storedPathName);
   return false;
 }

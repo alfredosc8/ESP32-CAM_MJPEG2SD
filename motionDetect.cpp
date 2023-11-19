@@ -40,28 +40,32 @@ static size_t jpgImgSize = 0;
 
 static bool jpg2rgb(const uint8_t *src, size_t src_len, uint8_t ** out, jpg_scale_t scale);
 
-static bool isNight(uint8_t nightSwitch) {
+bool isNight(uint8_t nightSwitch) {
   // check if night time for suspending recording
   // or for switching on lamp if enabled
   static bool nightTime = false;
   static uint16_t nightCnt = 0;
-  if (!nightTime && lightLevel < nightSwitch) {
-    // dark image
-    nightCnt += 1;
-    // only signal night time after given sequence of dark frames
-    if (nightCnt > detectNightFrames
-  ) {
-      nightTime = true;     
-      LOG_INF("Night time"); 
+  if (nightTime) {
+    if (lightLevel > nightSwitch) {
+      // light image
+      nightCnt--;
+      // signal day time after given sequence of light frames
+      if (nightCnt == 0) {
+        nightTime = false;
+        LOG_INF("Day time");
+      }
+    }
+  } else {
+    if (lightLevel < nightSwitch) {
+      // dark image
+      nightCnt++;
+      // signal night time after given sequence of dark frames
+      if (nightCnt > detectNightFrames) {
+        nightTime = true;     
+        LOG_INF("Night time"); 
+      }
     }
   } 
-  if (lightLevel > nightSwitch) {
-    nightCnt = 0;
-    if (nightTime) {
-      nightTime = false;
-      LOG_INF("Day time");
-    }
-  }  
   return nightTime;
 }
 
@@ -136,6 +140,10 @@ bool checkMotion(camera_fb_t* fb, bool motionStatus) {
     if (!motionStatus && motionCnt >= detectMotionFrames) {
       LOG_DBG("***** Motion - START");
       motionStatus = true; // motion started
+      if (mqtt_active) {
+        sprintf(jsonBuff, "{\"MOTION\":\"ON\",\"TIME\":\"%s\"}",esp_log_system_timestamp());
+        mqttPublish(jsonBuff);
+      }
     } 
     if (dbgMotion)
       // to highlight movement detected in changeMap image, set all gray in region of interest to black
@@ -147,22 +155,26 @@ bool checkMotion(camera_fb_t* fb, bool motionStatus) {
       LOG_DBG("***** Motion - STOP after %u frames", motionCnt);
       motionCnt = 0;
       motionStatus = false; // motion stopped
+      if (mqtt_active) {
+        sprintf(jsonBuff, "{\"MOTION\":\"OFF\",\"TIME\":\"%s\"}", esp_log_system_timestamp());
+        mqttPublish(jsonBuff);
+      }
     }
   }
   if (motionStatus) LOG_DBG("*** Motion - ongoing %u frames", motionCnt);
+  LOG_DBG("============================");
 
-  if (dbgMotion) { 
-    // build jpeg of changeMap for debug streaming
+  if (dbgMotion && !jpgImgSize) {
+    // ready to setup next movement map for streaming
     dTime = millis();
+    // build jpeg of changeMap for debug streaming
     if (!fmt2jpg(changeMap, num_pixels, sampleWidth, sampleHeight, PIXFORMAT_GRAYSCALE, 80, &jpg_buf, &jpg_len))
       LOG_ERR("motionDetect: fmt2jpg() failed");
-    // prevent streaming from accessing jpeg while it is being updated
-    xSemaphoreTake(motionMutex, portMAX_DELAY); 
     memcpy(jpgImg, jpg_buf, jpg_len);
-    jpgImgSize = jpg_len; 
-    xSemaphoreGive(motionMutex);
+    jpgImgSize = jpg_len;                      
     free(jpg_buf);
     jpg_buf = NULL;
+    xSemaphoreGive(motionSemaphore);
     LOG_DBG("Created changeMap JPEG %d bytes in %lums", jpg_len, millis() - dTime);
   }
 
@@ -171,9 +183,14 @@ bool checkMotion(camera_fb_t* fb, bool motionStatus) {
   return nightTime ? false : motionStatus;
 }
 
+void resetMotionMapSize() {
+  // flag that image processed by showStream()
+  jpgImgSize = 0;
+}
+
 bool fetchMoveMap(uint8_t **out, size_t *out_len) {
   // return change map jpeg for streaming
-  if (useMotion){                    
+  if (useMotion) {                   
     *out = jpgImg;
     *out_len = jpgImgSize;
     static size_t lastImgLen = 0;
@@ -182,7 +199,7 @@ bool fetchMoveMap(uint8_t **out, size_t *out_len) {
       lastImgLen = jpgImgSize;
       return true;
     } else return false;
-  }else{
+  } else {
      // dummy if motionDetect.cpp not used
     *out_len = 0;
     return false;

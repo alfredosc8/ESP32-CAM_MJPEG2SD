@@ -1,12 +1,12 @@
 // General purpose SD card and flash storage utilities
 //
-// s60sc 2021, 2022
+// s60sc 2021, 2022 
 
 #include "appGlobals.h"
 
 // Storage settings
 int sdMinCardFreeSpace = 100; // Minimum amount of card free Megabytes before sdFreeSpaceMode action is enabled
-int sdFreeSpaceMode = 1; // 0 - No Check, 1 - Delete oldest dir, 2 - Upload to ftp and then delete folder on SD 
+int sdFreeSpaceMode = 1; // 0 - No Check, 1 - Delete oldest dir, 2 - Upload oldest dir to ftp and then delete on SD 
 bool formatIfMountFailed = true; // Auto format the file system if mount failed. Set to false to not auto format.
 
 // hold sorted list of filenames/folders names in order of newest first
@@ -15,7 +15,6 @@ static auto currentDir = "/~current";
 static auto previousDir = "/~previous";
 static char fsType[10] = {0};
 
-#ifdef INCLUDE_SD
 static void infoSD() {
   uint8_t cardType = SD_MMC.cardType();
   if (cardType == CARD_NONE) LOG_WRN("No SD card attached");
@@ -24,13 +23,7 @@ static void infoSD() {
     if (cardType == CARD_MMC) strcpy(typeStr, "MMC");
     else if (cardType == CARD_SD) strcpy(typeStr, "SDSC");
     else if (cardType == CARD_SDHC) strcpy(typeStr, "SDHC");
-
-    uint64_t cardSize, totBytes, useBytes = 0;
-    cardSize = SD_MMC.cardSize() / ONEMEG;
-    totBytes = SD_MMC.totalBytes() / ONEMEG;
-    useBytes = SD_MMC.usedBytes() / ONEMEG;
-    LOG_INF("SD card type %s, Size: %lluMB, Used space: %lluMB, of total: %lluMB",
-             typeStr, cardSize, useBytes, totBytes);
+    LOG_INF("SD card type %s, Size: %s", typeStr, fmtSize(SD_MMC.cardSize()));
   }
 }
 
@@ -45,11 +38,16 @@ static bool prepSD_MMC() {
       D1          4
   */
   bool res = false;
-  if (psramFound()) heap_caps_malloc_extmem_enable(5); // small number to force vector into psram
+  if (psramFound()) heap_caps_malloc_extmem_enable(MIN_RAM); // small number to force vector into psram
   fileVec.reserve(1000);
-  if (psramFound()) heap_caps_malloc_extmem_enable(4096);
+  if (psramFound()) heap_caps_malloc_extmem_enable(MAX_RAM);
 #if CONFIG_IDF_TARGET_ESP32S3
+#if !defined(SD_MMC_CLK)
+  LOG_ERR("SD card pins not defined");
+  return false;
+#else
   SD_MMC.setPins(SD_MMC_CLK, SD_MMC_CMD, SD_MMC_D0);
+#endif
 #endif
   
   res = SD_MMC.begin("/sdcard", true, formatIfMountFailed);
@@ -58,7 +56,7 @@ static bool prepSD_MMC() {
   digitalWrite(4, 0); // set lamp pin fully off as sd_mmc library still initialises pin 4 in 1 line mode
 #endif 
   if (res) {
-    SD_MMC.mkdir(DATA_DIR);
+    STORAGE.mkdir(DATA_DIR);
     infoSD();
     res = true;
   } else {
@@ -67,21 +65,31 @@ static bool prepSD_MMC() {
   }
   return res;
 }
-#endif
+
+static void listFolder(const char* rootDir) { 
+  // list contents of folder
+  LOG_INF("Sketch size %s", fmtSize(ESP.getSketchSize()));    
+  File root = STORAGE.open(rootDir);
+  File file = root.openNextFile();
+  while (file) {
+    LOG_INF("File: %s, size: %s", file.path(), fmtSize(file.size()));
+    file = root.openNextFile();
+  }
+  LOG_INF("%s: %s used", fsType, fmtSize(STORAGE.usedBytes()));
+}
 
 bool startStorage() {
   // start required storage device (SD card or flash file system)
   bool res = false;
-#ifdef INCLUDE_SD  
   if ((fs::SDMMCFS*)&STORAGE == &SD_MMC) {
     strcpy(fsType, "SD_MMC");
     res = prepSD_MMC();
-    if (!res) sprintf(startupFailure, "Startup Failure: Check SD card inserted");
-    else checkFreeSpace();
+    if (res) listFolder(DATA_DIR);
+    else snprintf(startupFailure, SF_LEN, "Startup Failure: Check SD card inserted");
+    debugMemory("startStorage");
     return res; 
   }
-#endif
-
+  
   // One of SPIFFS or LittleFS
   if (!strlen(fsType)) {
 #ifdef _SPIFFS_H_
@@ -94,24 +102,19 @@ bool startStorage() {
     if ((fs::LittleFSFS*)&STORAGE == &LittleFS) {
       strcpy(fsType, "LittleFS");
       res = LittleFS.begin(formatIfMountFailed);
+      // create data folder if not present
+      LittleFS.mkdir(DATA_DIR);
     }
 #endif
     if (res) {  
       // list details of files on file system
-      const char* rootDir = !strcmp(fsType, "LittleFS") ? "/data" : "/";
-      File root = STORAGE.open(rootDir);
-      File file = root.openNextFile();
-      while (file) {
-        LOG_INF("File: %s, size: %u", file.path(), file.size());
-        file = root.openNextFile();
-      }
-      LOG_INF("%s: Total bytes %lld, Used bytes %lld", fsType, (uint64_t)(STORAGE.totalBytes()), (uint64_t)(STORAGE.usedBytes())); 
+      const char* rootDir = !strcmp(fsType, "LittleFS") ? DATA_DIR : "/";
+      listFolder(rootDir);
     }
   } else {
-    sprintf(startupFailure, "Failed to mount %s", fsType);  
+    snprintf(startupFailure, SF_LEN, "Failed to mount %s", fsType);  
     dataFilesChecked = true; // disable setupAssist as no file system
   }
-  LOG_INF("Sketch size %dkB", ESP.getSketchSize() / 1024);
   debugMemory("startStorage");
   return res;
 }
@@ -124,9 +127,7 @@ void getOldestDir(char* oldestDir) {
   while (file) {
     if (file.isDirectory() && strstr(file.name(), "System") == NULL // ignore Sys Vol Info
         && strstr(DATA_DIR, file.name()) == NULL) { // ignore data folder
-      if (strcmp(oldestDir, file.path()) > 0) {
-      strcpy(oldestDir, file.path()); 
-      }
+      if (strcmp(oldestDir, file.path()) > 0) strcpy(oldestDir, file.path()); 
     }
     file = root.openNextFile();
   }
@@ -140,8 +141,8 @@ void inline getFileDate(File file, char* fileDate) {
   strftime(fileDate, sizeof(fileDate), "%Y-%m-%d %H:%M:%S", &lt);
 }
 
-bool checkFreeSpace() { 
-  // Check for sufficient space on SD card
+bool checkFreeStorage() { 
+  // Check for sufficient space on storage
   bool res = false;
   size_t freeSize = (size_t)((STORAGE.totalBytes() - STORAGE.usedBytes()) / ONEMEG);
   if (!sdFreeSpaceMode && freeSize < sdMinCardFreeSpace) 
@@ -156,21 +157,17 @@ bool checkFreeSpace() {
       if (sdFreeSpaceMode == 2) ftpFileOrFolder(oldestDir); // Upload and then delete oldest folder
 #endif
       deleteFolderOrFile(oldestDir);
+      freeSize = (size_t)((STORAGE.totalBytes() - STORAGE.usedBytes()) / ONEMEG);
     }
-    LOG_INF("Card free space: %uMB", freeSize);
+    LOG_INF("Storage free space: %s", fmtSize(STORAGE.totalBytes() - STORAGE.usedBytes()));
     res = true;
   }
   return res;
 } 
 
-bool listDir(const char* fname, char* jsonBuff, size_t jsonBuffLen, const char* extension) {
-  // either list day folders in root, or files in a day folder
-  bool hasExtension = false;
-  char partJson[200]; // used to build SD page json buffer
+void setFolderName(const char* fname, char* fileName) {
+  // set current or previous folder 
   char partName[FILE_NAME_LEN];
-  char fileName[FILE_NAME_LEN];
-  bool noEntries = true;
-  // set current or previous folder
   if (strchr(fname, '~') != NULL) {
     if (!strcmp(fname, currentDir)) {
       dateFormat(partName, sizeof(partName), true);
@@ -188,6 +185,15 @@ bool listDir(const char* fname, char* jsonBuff, size_t jsonBuffLen, const char* 
       LOG_INF("Previous directory set to %s", fileName);
     } else strcpy(fileName, ""); 
   } else strcpy(fileName, fname);
+}
+
+bool listDir(const char* fname, char* jsonBuff, size_t jsonBuffLen, const char* extension) {
+  // either list day folders in root, or files in a day folder
+  bool hasExtension = false;
+  char partJson[200]; // used to build SD page json buffer
+  bool noEntries = true;
+  char fileName[FILE_NAME_LEN];
+  setFolderName(fname, fileName);
 
   // check if folder or file
   if (strstr(fileName, extension) != NULL) {
@@ -209,7 +215,7 @@ bool listDir(const char* fname, char* jsonBuff, size_t jsonBuffLen, const char* 
     // build relevant option list
     strcpy(jsonBuff, returnDirs ? "{" : "{\"/\":\".. [ Up ]\",");            
     File file = root.openNextFile();
-    if (psramFound()) heap_caps_malloc_extmem_enable(5); // small number to force vector into psram
+    if (psramFound()) heap_caps_malloc_extmem_enable(MIN_RAM); // small number to force vector into psram
     while (file) {
       if (returnDirs && file.isDirectory() && strstr(DATA_DIR, file.name()) == NULL) {  
         // build folder list, ignore data folder
@@ -220,14 +226,14 @@ bool listDir(const char* fname, char* jsonBuff, size_t jsonBuffLen, const char* 
       if (!returnDirs && !file.isDirectory()) {
         // build file list
         if (strstr(file.name(), extension) != NULL) {
-          sprintf(partJson, "\"%s\":\"%s %0.1fMB\",", file.path(), file.name(), (float)file.size() / ONEMEG);
+          sprintf(partJson, "\"%s\":\"%s %s\",", file.path(), file.name(), fmtSize(file.size()));
           fileVec.push_back(std::string(partJson));
           noEntries = false;
         }
       }
       file = root.openNextFile();
     }
-    if (psramFound()) heap_caps_malloc_extmem_enable(4096);
+    if (psramFound()) heap_caps_malloc_extmem_enable(MAX_RAM);
   }
   
   if (noEntries && !hasExtension) sprintf(jsonBuff, "{\"/\":\"List folders\",\"%s\":\"Go to current (today)\",\"%s\":\"Go to previous (yesterday)\"}", currentDir, previousDir);
@@ -249,35 +255,49 @@ bool listDir(const char* fname, char* jsonBuff, size_t jsonBuffLen, const char* 
 
 void deleteFolderOrFile(const char* deleteThis) {
   // delete supplied file or folder, unless it is a reserved folder
-  File df = STORAGE.open(deleteThis);
+  char fileName[FILE_NAME_LEN];
+  setFolderName(deleteThis, fileName);
+  File df = STORAGE.open(fileName);
   if (!df) {
-    LOG_ERR("Failed to open %s", deleteThis);
+    LOG_ERR("Failed to open %s", fileName);
     return;
   }
-  if (df.isDirectory() && (strstr(deleteThis, "System") != NULL 
-      || strstr("/", deleteThis) != NULL)) {
+  if (df.isDirectory() && (strstr(fileName, "System") != NULL 
+      || strstr("/", fileName) != NULL)) {
     df.close();   
-    LOG_ERR("Deletion of %s not permitted", deleteThis);
+    LOG_ERR("Deletion of %s not permitted", fileName);
+    delay(1000); // reduce thrashing on same error
     return;
   }  
-  LOG_INF("Deleting : %s", deleteThis);
+  LOG_INF("Deleting : %s", fileName);
   // Empty named folder first
-  if (df.isDirectory() || ((!strcmp(fsType, "SPIFFS")) && strstr("/", deleteThis) != NULL)) {
-    LOG_INF("Folder %s contents", deleteThis);
+  if (df.isDirectory() || ((!strcmp(fsType, "SPIFFS")) && strstr("/", fileName) != NULL)) {
+    LOG_INF("Folder %s contents", fileName);
     File file = df.openNextFile();
     while (file) {
       char filepath[FILE_NAME_LEN];
       strcpy(filepath, file.path()); 
       if (file.isDirectory()) LOG_INF("  DIR : %s", filepath);
       else {
-        int fileSize = file.size() / ONEMEG;
+        size_t fSize = file.size();
         file.close();
-        LOG_INF("  FILE : %s Size : %dMB %sdeleted", filepath, fileSize, STORAGE.remove(filepath) ? "" : "not ");
+        LOG_INF("  FILE : %s Size : %s %sdeleted", filepath, fmtSize(fSize), STORAGE.remove(filepath) ? "" : "not ");
       }
       file = df.openNextFile();
     }
     // Remove the folder
-    if (df.isDirectory()) LOG_ALT("Folder %s %sdeleted", deleteThis, STORAGE.rmdir(deleteThis) ? "" : "not ");
+    if (df.isDirectory()) LOG_ALT("Folder %s %sdeleted", fileName, STORAGE.rmdir(fileName) ? "" : "not ");
     else df.close();
-  } else LOG_ALT("File %s %sdeleted", deleteThis, STORAGE.remove(deleteThis) ? "" : "not ");  //Remove the file
+  } else {
+    // delete individual file
+    df.close();
+    LOG_ALT("File %s %sdeleted", deleteThis, STORAGE.remove(deleteThis) ? "" : "not ");  //Remove the file
+#ifdef ISCAM
+    // delete corresponding csv file if exists
+    char csvDeleteName[FILE_NAME_LEN];
+    strcpy(csvDeleteName, deleteThis);
+    changeExtension(csvDeleteName, CSV_EXT);
+    if (STORAGE.remove(csvDeleteName)) LOG_INF("File %s deleted", csvDeleteName);
+#endif  
+  }
 }

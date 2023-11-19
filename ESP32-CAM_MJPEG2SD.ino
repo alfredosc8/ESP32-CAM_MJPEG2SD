@@ -4,19 +4,8 @@
 *
 * s60sc 2020 - 2023
 */
-// built using arduino-esp32 stable release v2.0.6
 
 #include "appGlobals.h"
-#include "camera_pins.h"
-
-// camera board selected
-#if defined(CAMERA_MODEL_AI_THINKER)
-#define CAM_BOARD "CAMERA_MODEL_AI_THINKER"
-#elif defined(CAMERA_MODEL_ESP32S3_EYE)
-#define CAM_BOARD "CAMERA_MODEL_ESP32S3_EYE"
-#else
-#define CAM_BOARD "OTHER"
-#endif
 
 char camModel[10];
 
@@ -53,7 +42,7 @@ static void prepCam() {
   config.frame_size = FRAMESIZE_UXGA;  // 4M
 #endif  
   config.jpeg_quality = 10;
-  config.fb_count = 4;
+  config.fb_count = FB_BUFFERS;
 
 #if defined(CAMERA_MODEL_ESP_EYE)
   pinMode(13, INPUT_PULLUP);
@@ -75,7 +64,7 @@ static void prepCam() {
         retries--;
       }
     } 
-    if (err != ESP_OK) sprintf(startupFailure, "Startup Failure: Camera init error 0x%x", err);
+    if (err != ESP_OK) snprintf(startupFailure, SF_LEN, "Startup Failure: Camera init error 0x%x", err);
     else {
       sensor_t * s = esp_camera_sensor_get();
       switch (s->id.PID) {
@@ -101,8 +90,10 @@ static void prepCam() {
         s->set_brightness(s, 1);//up the brightness just a bit
         s->set_saturation(s, -2);//lower the saturation
       }
-      //drop down frame size for higher initial frame rate
-      s->set_framesize(s, FRAMESIZE_SVGA);
+      // set frame size to configured value
+      char fsizePtr[4];
+      if (retrieveConfigVal("framesize", fsizePtr)) s->set_framesize(s, (framesize_t)(atoi(fsizePtr)));
+      else s->set_framesize(s, FRAMESIZE_SVGA);
   
 #if defined(CAMERA_MODEL_M5STACK_WIDE)
       s->set_vflip(s, 1);
@@ -122,41 +113,46 @@ static void prepCam() {
   debugMemory("prepCam");
 }
 
-void setup() { 
+void setup() {   
   logSetup();
-  LOG_INF("=============== Starting ===============");
-  if (!psramFound()) sprintf(startupFailure, "Startup Failure: Need PSRAM to be enabled");
-  
-  // prep SD card storage
-  startStorage();
+  if (!psramFound()) snprintf(startupFailure, SF_LEN, "Startup Failure: Need PSRAM to be enabled");
+  else {
+    // prep SD card storage
+    startStorage(); 
 
-  // initialise camera
-  prepCam();
+    // Load saved user configuration
+    loadConfig();
   
-  // Load saved user configuration
-  loadConfig();
-
+    // initialise camera
+    prepCam();
+  }
+  
 #ifdef DEV_ONLY
   devSetup();
 #endif
 
   // connect wifi or start config AP if router details not available
   startWifi();
-  
+
   startWebServer();
   if (strlen(startupFailure)) LOG_ERR("%s", startupFailure);
   else {
     // start rest of services
-    startStreamServer();
+    startSustainTasks(); 
     prepSMTP(); 
     prepPeripherals();
     prepMic(); 
-    prepRecording();
-    LOG_INF("Camera model %s on board %s ready @ %uMHz, version %s", camModel, CAM_BOARD, xclkMhz, APP_VER); 
+    prepTelemetry();
+    prepRecording(); 
+    prepTelegram();
+    LOG_INF("Camera model %s on board %s ready @ %uMHz", camModel, CAM_BOARD, xclkMhz); 
     checkMemory();
   } 
 }
 
 void loop() {
+  // confirm not blocked in setup
+  LOG_INF("=============== Total tasks: %u ===============\n", uxTaskGetNumberOfTasks() - 1);
+  delay(1000);
   vTaskDelete(NULL); // free 8k ram
 }
